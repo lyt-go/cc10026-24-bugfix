@@ -36,7 +36,6 @@ class RateLimiterService(BaseModuleService):
 
     def check_rate_limit(self, api_name: str, caller: str, rate_type: str = "daily") -> dict[str, Any]:
         """检查调用方是否超过频率限制。返回限流检查结果。"""
-        from app.services.data_manager import write_audit
         from app.store import store as s
 
         rows = store.rows(self.MODULE)
@@ -52,26 +51,23 @@ class RateLimiterService(BaseModuleService):
                 today = self._today_str()
                 audits = list_audit(api_name=api_name, caller=caller, start_time=today)
                 if len(audits) >= limit:
-                    # 超限 → 写审计记录
-                    audit_id = self._next_audit_id()
-                    write_audit(audit_id, {
-                        "audit_id": audit_id,
+                    # 超限 → 写审计记录（按事件身份分配编号）
+                    from app.services.data_manager import append_audit_event
+                    append_audit_event("rate_limiter", "rate_limit_exceeded", {
                         "api_name": api_name,
                         "caller": caller,
                         "event": "rate_limit_exceeded",
                         "limit": limit,
                         "current_count": len(audits),
                         "action": row.get("超限动作", "拒绝"),
-                    })
+                    }, business_key=f"rate_limiter:{api_name}:{caller}:{today}:{len(audits)}")
                     return {"allowed": False, "limit": limit, "current_count": len(audits), "reason": "超过频率限制"}
                 return {"allowed": True, "limit": limit, "current_count": len(audits), "reason": "正常"}
         return {"allowed": True, "limit": 0, "reason": "未配置限流策略"}
 
     def _next_audit_id(self) -> int:
-        from app.services.data_manager import DATA_ROOT
-        import os
-        existing = list(DATA_ROOT.glob("audit/[0-9]*.json"))
-        return max((int(f.stem) for f in existing), default=0) + 1
+        from app.services.data_manager import next_audit_id
+        return next_audit_id()
 
     def _today_str(self) -> str:
         from datetime import datetime, timedelta, timezone

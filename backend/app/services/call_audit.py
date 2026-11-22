@@ -27,27 +27,104 @@ class CallAuditService(BaseModuleService):
 
     def record_api_call(self, caller: str, api_name: str, params: str = "",
                         response_code: str = "200", latency_ms: float = 0.0,
-                        result_rows: int = 0) -> dict[str, Any]:
-        """记录一次API调用到审计日志。"""
-        from app.services.data_manager import write_audit
+                        result_rows: int = 0,
+                        response_body: str = "") -> dict[str, Any]:
+        """记录一次API调用到审计日志。
+
+        审计号先占位再落盘：普通调用即使和导出事件拿到同一候选号，
+        也不会覆盖导出的审计记录；请求与响应同时单独持久化。
+        """
+        from app.services.data_manager import (
+            reserve_audit, stage_audit, commit_audit, write_call_payload,
+            update_audit,
+        )
         from app.store import store as s
 
         audit_rows = s.rows(self.MODULE)
         new_id = max((int(r.get("id", 0)) for r in audit_rows), default=0) + 1
         record_no = f"CALL-{new_id:04d}"
+        timestamp = self._now_iso()
 
-        audit_data = {
-            "audit_id": new_id,
+        request_payload = {
             "record_no": record_no,
             "caller": caller,
             "api_name": api_name,
-            "request_params": params,
+            "params": params,
+            "timestamp": timestamp,
+        }
+        response_payload = {
+            "record_no": record_no,
             "response_code": response_code,
             "latency_ms": latency_ms,
             "result_rows": result_rows,
-            "timestamp": self._now_iso(),
+            "body": response_body,
         }
-        write_audit(new_id, audit_data)
+
+        reservation = reserve_audit(
+            "call_audit",
+            event="call_completed",
+            candidate_id=new_id,
+            business_key=f"call_audit:{record_no}",
+            payload={
+                "api_name": api_name,
+                "caller": caller,
+                "event": "call_completed",
+                "record_no": record_no,
+                "request_params": params,
+                "response_code": response_code,
+                "latency_ms": latency_ms,
+                "result_rows": result_rows,
+            },
+        )
+
+        audit_data = {
+            "record_no": record_no,
+            "caller": caller,
+            "api_name": api_name,
+            "event": "call_completed",
+            "request_params": params,
+            "request": request_payload,
+            "response": response_payload,
+            "response_code": response_code,
+            "latency_ms": latency_ms,
+            "result_rows": result_rows,
+            "timestamp": timestamp,
+            "status": "completed",
+            "production_source": {
+                "producer": "call_audit",
+                "event": "call_completed",
+                "record_no": record_no,
+            },
+        }
+
+        if reservation.get("status") == "committed":
+            audit_id = int(reservation.get("audit_id", 0))
+            committed = dict(reservation.get("record") or {})
+        else:
+            stage_audit(reservation, audit_data)
+            committed = commit_audit(reservation, audit_data)
+            audit_id = int(committed.get("audit_id", reservation.get("audit_id", 0)))
+
+        payload_path = write_call_payload(audit_id, request_payload, response_payload)
+        committed.setdefault("production_source", {})
+        committed["production_source"]["producer"] = "call_audit"
+        committed["production_source"]["event"] = "call_completed"
+        committed["production_source"]["record_no"] = record_no
+        committed["production_source"]["audit_id"] = audit_id
+        committed["payload_path"] = payload_path
+        committed["request"] = request_payload
+        committed["response"] = response_payload
+        updated = update_audit(
+            audit_id, producer="call_audit",
+            changes={
+                "payload_path": payload_path,
+                "request": request_payload,
+                "response": response_payload,
+                "production_source": committed["production_source"],
+            },
+        )
+        if updated:
+            committed = updated
 
         # 同时记录到内存
         entry = {
@@ -59,7 +136,10 @@ class CallAuditService(BaseModuleService):
             "响应码": response_code,
             "响应耗时": str(latency_ms),
             "返回行数": str(result_rows),
-            "时间戳": self._now_iso(),
+            "时间戳": timestamp,
+            "审计号": str(audit_id),
+            "响应内容": response_body,
+            "生产来源": "call_audit/call_completed",
             "status": "已记录",
             "pending": True,
             "abnormal": response_code != "200",
@@ -70,6 +150,126 @@ class CallAuditService(BaseModuleService):
     def _now_iso(self) -> str:
         from datetime import datetime, timedelta, timezone
         return datetime.now(timezone(timedelta(hours=8))).isoformat()
+
+    def _next_audit_id(self) -> int:
+        """候选编号：只作建议，最终由 reserve_audit 独占分配。"""
+        from app.services.data_manager import next_audit_id
+        return next_audit_id()
+
+    def append_audit_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """把工作台手工登记的调用记录补成可追溯的审计事件。
+
+        编号由 reserve_audit 分配，避免和导出或历史审计撞号。
+        """
+        from app.services.data_manager import (
+            reserve_audit, stage_audit, commit_audit, write_call_payload,
+        )
+
+        record_no = str(entry.get("记录编号") or "")
+        audit_data = {
+            "record_no": record_no,
+            "caller": entry.get("调用方", ""),
+            "api_name": entry.get("目标API", ""),
+            "event": "call_completed",
+            "request_params": entry.get("请求参数", ""),
+            "response_code": entry.get("响应码", ""),
+            "latency_ms": entry.get("响应耗时", ""),
+            "result_rows": entry.get("返回行数", ""),
+            "status": "completed",
+            "production_source": {
+                "producer": "call_audit",
+                "event": "call_completed",
+                "record_no": record_no,
+            },
+        }
+        reservation = reserve_audit(
+            "call_audit", event="call_completed",
+            candidate_id=self._next_audit_id(),
+            business_key=f"call_audit:{record_no}", payload=audit_data)
+        if reservation.get("status") == "committed":
+            record = dict(reservation.get("record") or {})
+        else:
+            stage_audit(reservation, audit_data)
+            record = commit_audit(reservation, audit_data)
+        audit_id = int(record.get("audit_id", reservation.get("audit_id", 0)))
+        write_call_payload(audit_id, {
+            "record_no": record_no,
+            "caller": entry.get("调用方", ""),
+            "api_name": entry.get("目标API", ""),
+            "params": entry.get("请求参数", ""),
+        }, {
+            "record_no": record_no,
+            "response_code": entry.get("响应码", ""),
+            "latency_ms": entry.get("响应耗时", ""),
+            "result_rows": entry.get("返回行数", ""),
+        })
+        entry["审计号"] = str(audit_id)
+        return entry
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        """登记调用记录时同步落一份审计事件与请求/响应。"""
+        entry, missing = super().create_entry(values)
+        if entry is not None:
+            self.append_audit_entry(entry)
+        return entry, missing
+
+    def query_audit_log(self, *, audit_id: int | None = None,
+                        record_no: str | None = None,
+                        api_name: str | None = None,
+                        caller: str | None = None) -> list[dict[str, Any]]:
+        """调用审计查询入口：同步返回普通调用的请求、响应和生产来源。
+
+        只读取审计目录里的正式记录；导出证据和调用请求/响应各自从
+        自己的落盘位置补充，不会把另一方的完成事件当成本次结果。
+        """
+        from app.services.data_manager import (
+            list_audit, read_audit, read_call_payload, read_export_evidence,
+        )
+
+        if audit_id is not None:
+            record = read_audit(int(audit_id))
+            records = [record] if record else []
+        else:
+            records = list_audit(api_name=api_name, caller=caller)
+
+        results: list[dict[str, Any]] = []
+        for record in records:
+            enriched = dict(record)
+            rid = int(enriched.get("audit_id", 0) or 0)
+            producer = str(enriched.get("producer") or enriched.get("source") or "")
+            record_no_value = str(enriched.get("record_no") or "")
+            if record_no and record_no_value != record_no:
+                continue
+            if producer == "call_audit" or enriched.get("event") == "call_completed":
+                payload = read_call_payload(rid)
+                enriched["request"] = payload.get("request", enriched.get("request", {}))
+                enriched["response"] = payload.get("response", enriched.get("response", {}))
+                enriched["payload_path"] = (
+                    enriched.get("payload_path") or f"audit/calls/{rid:06d}.json")
+            elif producer == "export_task" or enriched.get("event") == "export_completed":
+                evidence = read_export_evidence(rid)
+                enriched["export_evidence"] = evidence
+                enriched["evidence_path"] = (
+                    enriched.get("evidence_path")
+                    or f"audit/export_evidence/{rid:06d}.json")
+            enriched.setdefault("production_source", {
+                "producer": producer,
+                "event": enriched.get("event", ""),
+                "audit_id": rid,
+            })
+            enriched.setdefault("storage", f"audit/{rid:06d}.json")
+            results.append(enriched)
+        return results
+
+    # 兼容命名：查询入口的几种叫法
+    def query_audits(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.query_audit_log(**kwargs)
+
+    def audit_trail(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.query_audit_log(**kwargs)
+
+    def list_audit_log(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.query_audit_log(**kwargs)
 
     def verify_audits(self, caller: str, api_name: str) -> list[dict[str, Any]]:
         """校验调用方对指定API的审计记录。"""

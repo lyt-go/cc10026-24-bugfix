@@ -99,16 +99,14 @@ class SubscriptionService(BaseModuleService):
             })
 
             # 联动增强：自动记录审计——审批通过事件
-            from app.services.data_manager import write_audit, DATA_ROOT
-            audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-            write_audit(audit_id, {
-                "audit_id": audit_id,
+            from app.services.data_manager import append_audit_event
+            append_audit_event("subscription", "subscription_approved", {
                 "api_name": entry.get("订阅API"),
                 "caller": entry.get("申请方"),
                 "event": "subscription_approved",
                 "subscription_id": entry_id,
                 "approval_status": "已通过",
-            })
+            }, business_key=f"subscription:{entry_id}:approved")
 
         result = super().run_action(entry_id, action)
 

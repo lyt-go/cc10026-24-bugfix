@@ -60,23 +60,23 @@ class ErrorClassifyService(BaseModuleService):
         联动增强：归类后自动写入审计记录，供下游查询追溯。
         返回归类结果列表。
         """
-        from app.services.data_manager import read_module_snapshot, write_audit, DATA_ROOT
+        from app.services.data_manager import read_module_snapshot, append_audit_event
         results = []
         snap = read_module_snapshot("sla_events")
         if snap and snap.get("error_type"):
             classification = self.classify(snap.get("error_type", ""), snap.get("detail", ""))
             # 联动增强：写入审计记录
             if classification.get("matched"):
-                audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-                write_audit(audit_id, {
-                    "audit_id": audit_id,
+                append_audit_event("sla_monitor", "error_classified", {
                     "api_name": snap.get("api_name", ""),
                     "caller": "sla_monitor",
                     "event": "error_classified",
                     "type_name": classification.get("type_name"),
                     "severity": classification.get("severity"),
                     "retry_advice": classification.get("retry_advice"),
-                })
+                }, business_key=(
+                    f"error_classify:{snap.get('api_name', '')}:"
+                    f"{snap.get('error_type', '')}:{snap.get('timestamp', '')}"))
             results.append(classification)
         return results
 

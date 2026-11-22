@@ -77,5 +77,45 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 审计写入身份
+
+导出完成事件和普通调用事件都会写 `data/audit/<审计号>.json`。写入前先
+通过 `reserve_audit` 在 `data/audit/_claims/` 下独占一个编号；候选编号
+被占用时顺延，原审计号继续指向原记录。没有占位的一方不会被另一方的
+提交认领：
+
+- 导出已完成、普通调用尚未完成：支持人员仍可按原审计号复核导出，
+  普通调用恢复后在它自己的编号上落盘；
+- 普通调用已完成、导出尚未完成：调用记录保持完整，导出需要重新登记
+  （暂存过完整结果的导出会在重启时自动补写）。
+
+两类事件的附带产物分开存放：
+
+| 内容 | 落盘位置 |
+| --- | --- |
+| 导出完成证据 | `data/audit/export_evidence/<审计号>.json` |
+| 调用请求与响应 | `data/audit/calls/<审计号>.json` |
+| 导出成品 | `data/exports/<导出任务id>.json|.csv` |
+
+相关入口：
+
+- `GET /api/call_audit/query`：调用审计查询，返回请求、响应与生产来源；
+- `GET /api/call_audit/{audit_id}/audit-log`：按审计号读取单条记录；
+- `GET /api/export_task/audit-log?audit_id=`：按审计号读导出日志，行数与下载凭据一致；
+- `GET /api/export_task/{export_id}/audit`：按导出任务读取其完成事件；
+- `POST /api/call_audit/recover`：恢复未完成审计写入（服务启动时也会自动执行）。
+
+
 领域：数据工程
 子方向：数据分析与数据应用
+
+## 审计身份回归验证
+
+`backend/tests/test_audit_identity.py` 覆盖“3 行导出 + 返回 1 行普通调用
+在同一候选号窗口交错写盘，再恢复未完成写入”的场景，并分别沿原审计号、
+调用记录编号和导出成品编号核对行数与证据。环境里未安装 pytest 时可直接
+按函数顺序执行，或安装 pytest 后运行：
+
+```bash
+cd backend && .venv/bin/pip install pytest && .venv/bin/python -m pytest tests/test_audit_identity.py -q
+```

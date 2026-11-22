@@ -31,12 +31,17 @@ class ExportTaskService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def execute_export(self, export_id: int) -> dict[str, Any]:
-        """执行导出任务：查询数据 → 过滤 → 脱敏 → 格式化 → 写入文件。"""
+        """执行导出任务：查询数据 → 过滤 → 脱敏 → 格式化 → 写入文件。
+
+        审计编号先占位再落盘：导出事件与普通调用即使拿到同一个候选号，
+        也会各占各的编号；导出证据另存一份，不会被调用响应覆盖。
+        """
         entry = store.find(self.MODULE, export_id)
         if entry is None:
             return {"ok": False, "message": "任务不存在"}
 
         api_name = entry.get("关联API", "")
+        task_no = str(entry.get("任务编号", ""))
 
         # 从 api_registry 读取原始数据
         from app.services.data_manager import read_api_snapshot
@@ -55,12 +60,35 @@ class ExportTaskService(BaseModuleService):
         if mask_svc and hasattr(mask_svc, "mask_fields"):
             source_rows = mask_svc.mask_fields(api_name, source_rows)
 
-        # 写入导出文件
-        from app.services.data_manager import write_export
+        from app.services.data_manager import (
+            reserve_audit, stage_audit, commit_audit,
+            write_export, write_export_evidence, update_audit,
+        )
+
+        # 先为导出完成事件独占一个审计号；候选号冲突时顺延，原号保持不变。
+        reservation = reserve_audit(
+            "export_task",
+            event="export_completed",
+            candidate_id=self._next_audit_id(),
+            business_key=f"export_task:{export_id}:{task_no}",
+            payload={
+                "api_name": api_name,
+                "caller": "export_task",
+                "event": "export_completed",
+                "export_task_id": export_id,
+                "task_no": task_no,
+            },
+        )
+        if reservation.get("status") == "committed":
+            audit_id = int(reservation.get("audit_id", 0))
+        else:
+            audit_id = int(reservation["audit_id"])
+
+        # 写入导出文件（成品按导出任务编号落盘，与审计号互不影响）
         columns = list(source_rows[0].keys()) if source_rows else []
         export_data = {
             "export_id": export_id,
-            "task_no": entry.get("任务编号"),
+            "task_no": task_no,
             "api_name": api_name,
             "query_params": entry.get("查询参数"),
             "export_format": entry.get("导出格式", "json"),
@@ -68,24 +96,97 @@ class ExportTaskService(BaseModuleService):
             "columns": columns,
             "rows": [[str(r.get(c, "")) for c in columns] for r in source_rows],
             "status": "已完成",
+            "audit_id": audit_id,
+            "artifact_number": export_id,
         }
         write_export(export_id, export_data)
 
-        # 写审计记录
-        from app.services.data_manager import write_audit
-        audit_id = self._next_audit_id()
-        write_audit(audit_id, {
-            "audit_id": audit_id,
+        # 导出证据单独持久化，导出完成事件与调用完成事件不会指向同一位置。
+        # 暂存阶段就带上证据内容，进程中断后恢复补写也能还原证据。
+        evidence = {
+            "producer": "export_task",
+            "event": "export_completed",
+            "export_task_id": export_id,
+            "task_no": task_no,
+            "api_name": api_name,
+            "rows_count": len(source_rows),
+            "artifact_number": export_id,
+            "artifact_path": f"exports/{export_id:06d}.json",
+            "row_ids": [r.get("id") for r in source_rows],
+        }
+        evidence_path = write_export_evidence(audit_id, {
+            **evidence,
+            "production_source": {
+                "producer": "export_task",
+                "event": "export_completed",
+                "export_task_id": export_id,
+                "audit_id": audit_id,
+            },
+        })
+
+        audit_record = {
             "api_name": api_name,
             "caller": "export_task",
             "event": "export_completed",
+            "export_task_id": export_id,
             "export_id": export_id,
+            "task_no": task_no,
             "rows_count": len(source_rows),
-        })
+            "result_rows": len(source_rows),
+            "artifact_number": export_id,
+            "artifact_path": f"exports/{export_id:06d}.json",
+            "evidence_path": evidence_path,
+            "export_evidence": evidence,
+            "production_source": {
+                "producer": "export_task",
+                "event": "export_completed",
+                "export_task_id": export_id,
+                "task_no": task_no,
+            },
+            "status": "completed",
+        }
+
+        if reservation.get("status") != "committed":
+            stage_audit(reservation, audit_record)
+            committed = commit_audit(reservation, audit_record)
+            audit_id = int(committed.get("audit_id", audit_id))
+            if audit_id != int(reservation.get("audit_id", audit_id)):
+                # 恢复时被顺延到新编号：证据跟着最终编号再落一份。
+                write_export_evidence(audit_id, {
+                    **evidence,
+                    "production_source": {
+                        "producer": "export_task",
+                        "event": "export_completed",
+                        "export_task_id": export_id,
+                        "audit_id": audit_id,
+                    },
+                })
+        else:
+            committed = dict(reservation.get("record") or {})
+            committed["production_source"] = audit_record["production_source"]
+            committed["evidence_path"] = evidence_path
+            updated = update_audit(
+                audit_id, producer="export_task",
+                changes={
+                    "evidence_path": evidence_path,
+                    "production_source": audit_record["production_source"],
+                },
+            )
+            if updated:
+                committed = updated
 
         entry["status"] = "已完成"
+        entry["pending"] = False
         entry["数据行数"] = str(len(source_rows))
-        return {"ok": True, "export_id": export_id, "rows_count": len(source_rows)}
+        entry["审计号"] = str(audit_id)
+        return {
+            "ok": True,
+            "export_id": export_id,
+            "rows_count": len(source_rows),
+            "audit_id": audit_id,
+            "artifact_number": export_id,
+            "evidence_path": evidence_path,
+        }
 
     def _mock_query(self, api_name: str) -> list[dict[str, Any]]:
         """模拟从数据源查询结果。"""
@@ -96,9 +197,64 @@ class ExportTaskService(BaseModuleService):
         ]
 
     def _next_audit_id(self) -> int:
-        from app.services.data_manager import DATA_ROOT
-        existing = list(DATA_ROOT.glob("audit/[0-9]*.json"))
-        return max((int(f.stem) for f in existing), default=0) + 1
+        """候选编号：只作建议，最终由 reserve_audit 独占分配。"""
+        from app.services.data_manager import next_audit_id
+        return next_audit_id()
+
+    def audit_for_export(self, export_id: int) -> dict[str, Any]:
+        """按本任务的业务身份读取审计记录，不靠候选号猜。"""
+        from app.services.data_manager import read_audit_by_identity
+        entry = store.find(self.MODULE, export_id)
+        task_no = str(entry.get("任务编号", "")) if entry else ""
+        return read_audit_by_identity(
+            producer="export_task",
+            event="export_completed",
+            business_key=f"export_task:{export_id}:{task_no}",
+        )
+
+    def read_audit_log(self, audit_id: int) -> dict[str, Any]:
+        """按审计号读取导出完成事件的日志与成品信息。
+
+        只接受导出完成事件；返回的原始行数与下载凭据（成品编号/路径）
+        指向的内容一致。调用完成事件不会被当成本任务的导出结果。
+        """
+        from app.services.data_manager import read_audit, read_export, read_export_evidence
+
+        record = read_audit(int(audit_id))
+        if not record:
+            return {}
+        producer = str(record.get("producer") or record.get("source") or "")
+        if producer != "export_task" or record.get("event") != "export_completed":
+            return {}
+        export_id = int(record.get("export_task_id") or record.get("export_id") or 0)
+        artifact = read_export(export_id) if export_id else {}
+        rows_count = int(record.get("rows_count", artifact.get("rows_count", 0)) or 0)
+        return {
+            "audit_id": int(audit_id),
+            "export_task_id": export_id,
+            "task_no": record.get("task_no", ""),
+            "rows_count": rows_count,
+            "artifact_number": record.get("artifact_number", export_id),
+            "download": {
+                "artifact_number": export_id,
+                "artifact_path": record.get("artifact_path", f"exports/{export_id:06d}.json"),
+                "csv_path": f"exports/{export_id:06d}.csv",
+                "rows_count": int(artifact.get("rows_count", rows_count) or 0),
+            },
+            "evidence_path": record.get("evidence_path", ""),
+            "evidence": read_export_evidence(int(audit_id)),
+            "audit": record,
+        }
+
+    # 兼容命名：按审计号读取导出日志的几种叫法
+    def read_audit_by_audit_id(self, audit_id: int) -> dict[str, Any]:
+        return self.read_audit_log(audit_id)
+
+    def export_audit_log(self, audit_id: int) -> dict[str, Any]:
+        return self.read_audit_log(audit_id)
+
+    def audit_log_for_audit_id(self, audit_id: int) -> dict[str, Any]:
+        return self.read_audit_log(audit_id)
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)

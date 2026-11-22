@@ -76,16 +76,14 @@ class QueryRouteService(BaseModuleService):
                 row["_degrade_at"] = self._now_iso()
 
                 # 联动增强：记录降级事件到审计
-                from app.services.data_manager import write_audit, DATA_ROOT
-                audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
-                write_audit(audit_id, {
-                    "audit_id": audit_id,
+                from app.services.data_manager import append_audit_event
+                append_audit_event("sla_monitor", "route_degraded", {
                     "api_name": row.get("关联API", ""),
                     "caller": "sla_monitor",
                     "event": "route_degraded",
                     "reason": reason,
                     "degrade_at": row["_degrade_at"],
-                })
+                }, business_key=f"query_route:{row.get('id')}:{row['_degrade_at']}")
                 return row
         return {}
 

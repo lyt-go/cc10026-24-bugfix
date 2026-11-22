@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,7 +14,22 @@ from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 
-app = FastAPI(title="数据服务开放与订阅管理平台", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """服务重启后先恢复未完成的审计写入，再接收新请求。
+
+    只有暂存过完整结果的占位会被补写；仅登记过身份的占位释放编号，
+    等待对应事件重新登记，避免把另一方的记录认成本次结果。
+    """
+    from app.services.data_manager import recover_pending_audits
+
+    recover_pending_audits()
+    yield
+
+
+app = FastAPI(
+    title="数据服务开放与订阅管理平台", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
